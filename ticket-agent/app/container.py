@@ -1,0 +1,69 @@
+import logging
+from functools import cached_property
+from langchain_anthropic import ChatAnthropic
+from app.agent.ticket_graph import TicketGraph
+from app.agent.tools.mcp_client import McpClient
+from app.agent.tools.create_epic_tool import make_create_epic_tool
+from app.agent.tools.create_ticket_tool import make_create_ticket_tool
+from app.configs.settings import settings
+from app.events.handlers.accept_event_handler import AcceptEventHandler
+from app.events.rabbitmq_consumer import RabbitMQConsumer
+from app.services.chat_manager import ChatManager
+from app.services.redis_client import RedisClient
+from app.services.ticket_service import TicketService
+
+
+class Container:
+    def logger(self, name: str) -> logging.Logger:
+        return logging.getLogger(name)
+
+    @cached_property
+    def llm(self) -> ChatAnthropic:
+        return ChatAnthropic(
+            model="claude-sonnet-4-6",
+            api_key=settings.anthropic_api_key,
+            max_tokens=4096,
+        )
+
+    @cached_property
+    def mcp_client(self) -> McpClient:
+        return McpClient(settings.mcp_server_url)
+
+    @cached_property
+    def ticket_graph(self):
+        tools = [make_create_epic_tool(self.mcp_client), make_create_ticket_tool(self.mcp_client)]
+        return TicketGraph(self.llm, tools).build()
+
+    @cached_property
+    def redis_client(self):
+        return RedisClient().get()
+
+    @cached_property
+    def chat_manager(self) -> ChatManager:
+        return ChatManager(self.redis_client)
+
+    @cached_property
+    def ticket_service(self) -> TicketService:
+        return TicketService(
+            ticket_graph=self.ticket_graph,
+            chat_manager=self.chat_manager,
+            logger=self.logger("ticket_service"),
+        )
+
+    @cached_property
+    def accept_event_handler(self) -> AcceptEventHandler:
+        return AcceptEventHandler(
+            ticket_service=self.ticket_service,
+            logger=self.logger("accept_event_handler"),
+        )
+
+    @cached_property
+    def rabbitmq_consumer(self) -> RabbitMQConsumer:
+        return RabbitMQConsumer(
+            rabbitmq_url=settings.rabbitmq_url,
+            event_handler=self.accept_event_handler,
+            logger=self.logger("rabbitmq_consumer"),
+        )
+
+
+container = Container()

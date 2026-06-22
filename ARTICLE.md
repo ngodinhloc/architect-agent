@@ -1,0 +1,779 @@
+# Multi-Agent Pipelines: Building an Approval-Loop Architect with LangGraph
+
+This article walks through the design and implementation of a full-stack multi-agent application. A user types a software requirement — "implement an SFTP export solution" — and two independent agents collaborate: the **architect-agent** produces a solution architecture and development tickets through a directed approval-loop graph, and the **ticket-agent** — a separate two-node `StateGraph` — receives the accepted plan over RabbitMQ and persists it via LLM-driven tool calling followed by structured output extraction. Two embedded reviewer nodes run approval loops, each sending feedback back to the generator if the output is not good enough. Once both loops pass, the user sees the final plan. They can refine it with a follow-up, or accept it to trigger the ticket-agent.
+
+The focus is on the decisions that make this work in practice:
+- How to design a directed graph with conditional approval loops
+- How to structure node classes with injected dependencies and structured output contracts
+- How to carry conversation context across turns for the refine flow
+- How to hand off between two independent services using RabbitMQ
+- How to build a two-node ticket agent with a tool-calling loop and a structured extraction step
+- How to stream per-node progress to the browser in real time
+
+![Screenshot of the running application](./screenshot.png)
+
+![Agent thinking log](./screenshot_logs.png)
+
+*The thinking log streams live as each agent node completes. Review results show the approval status and any comments inline.*
+
+---
+
+## Architecture Overview
+
+![Architecture diagram](./architecture.png)
+
+**Frontend** (Next.js 15, port 3000) — requirement input, live thinking log, plan card, and final reply. Opens a WebSocket and receives real-time `chat-update` events as each agent node runs. Accepted plans link to `/epic/:id` and `/ticket/:id` detail pages served by dedicated Next.js routes.
+
+**Backend** (NestJS 11, port 8000) — REST chat API and ticket proxy. Creates conversations in PostgreSQL, manages live state in Redis, publishes `ChatEvent` to RabbitMQ, and drives the WebSocket gateway. Also proxies `/api/epic/*` and `/api/ticket/*` to the ticket-service so the browser never calls the internal service directly.
+
+**RabbitMQ** — two durable queues: `architecture-agent.chat` (backend → architect-agent) and `architecture-agent.accept` (architect-agent → ticket-agent). Both publishers return immediately; consumers process independently.
+
+**Architect Agent** (FastAPI + LangGraph, port 8001) — subscribes to `architecture-agent.chat`, runs the directed approval-loop graph, and writes progress to Redis after every node. On accept intent, publishes an `AcceptEvent` to `architecture-agent.accept` instead of creating tickets itself.
+
+**Ticket Agent** (FastAPI + LangGraph, port 8004) — subscribes to `architecture-agent.accept` and runs a two-node `StateGraph`. `create_node` drives a tool-calling loop (`create_epic` → `create_ticket` × N), then `extract_node` reads the tool results and writes `ExtractOut { epicId, ticketIds }` to state. `TicketService` converts this into `FinalReplyInterface`, writes it to Redis, and sets `agentStatus = hasReplied`.
+
+**MCP Server** (FastMCP + FastAPI, port 8002) — exposes `create_epic` and `create_ticket` over the MCP protocol. The ticket-agent calls them via `McpClient`; the MCP server translates the calls into REST requests to the ticket-service.
+
+**Ticket Service** (NestJS 11, port 8003) — minimal CRUD service backed by its own PostgreSQL instance. No RabbitMQ, no Redis, no WebSocket.
+
+---
+
+## Step 1 — Design a Multi-Agent Approval Loop Graph
+
+A ReAct agent (like the tourguide-agent) uses a single LLM instance deciding which tools to call in an open-ended loop. This project uses a different pattern: a **directed graph of specialised agents**, each with a narrow role, connected by explicit conditional edges.
+
+The graph has two approval loops:
+
+```
+intent_node
+  │
+  ├─[plan / refine]──► solution_node ◄──────────────┐
+  │                         │                       │
+  │                  solution_review_node            │
+  │                    │           │                 │
+  │                [approved]  [rejected] ───────────┘
+  │                    │
+  │               plan_node ◄──────────────────────┐
+  │                    │                           │
+  │             plan_review_node                   │
+  │                │         │                     │
+  │            [approved] [rejected] ──────────────┘
+  │                │
+  │           reply_node ──► END
+  │
+  └─[accept]──► publish AcceptEvent to architecture-agent.accept ──► END
+```
+
+The accept path no longer creates tickets inside the graph. `IntentNode` publishes the full plan to RabbitMQ and returns immediately, leaving `agentStatus = isThinking` in Redis. The ticket-agent picks up the event asynchronously and finalises the conversation.
+
+Each approval loop feeds the reviewer's comments back into the generator node as context for the next iteration. The generator never sees an empty critique — if it is rejected, it knows exactly what to fix.
+
+Building the graph in LangGraph is explicit and readable:
+
+```python
+class ArchitectGraph:
+    def __init__(self, llm: ChatAnthropic, publisher: RabbitMQPublisher):
+        self._llm = llm
+        self._publisher = publisher
+
+    def build(self):
+        graph = StateGraph(ArchitectState)
+
+        graph.add_node("intent_node",          IntentNode(self._llm, self._publisher))
+        graph.add_node("solution_node",         SolutionNode(self._llm))
+        graph.add_node("solution_review_node",  SolutionReviewNode(self._llm))
+        graph.add_node("plan_node",             PlanNode(self._llm))
+        graph.add_node("plan_review_node",      PlanReviewNode(self._llm))
+        graph.add_node("reply_node",            ReplyNode())
+
+        graph.add_conditional_edges("intent_node", self._route_intent,
+            {"accept": END, "plan": "solution_node", "refine": "solution_node"})
+
+        graph.add_edge("solution_node", "solution_review_node")
+        graph.add_conditional_edges("solution_review_node", self._route_solution_review,
+            {"approved": "plan_node", "rejected": "solution_node"})
+
+        graph.add_edge("plan_node", "plan_review_node")
+        graph.add_conditional_edges("plan_review_node", self._route_plan_review,
+            {"approved": "reply_node", "rejected": "plan_node"})
+
+        graph.add_edge("reply_node", END)
+        return graph.compile()
+```
+
+`IntentNode` now receives the `RabbitMQPublisher` as a constructor dependency. On `accept` intent it publishes to the queue and returns `{"user_intent": "accept"}` — the graph routes to `END` immediately. On `refine`, it extracts the prior solution for context as before.
+
+The routing functions read directly from state — no complex logic, just field checks:
+
+```python
+@staticmethod
+def _route_solution_review(state: ArchitectState) -> str:
+    return "approved" if state.get("solution_approved") else "rejected"
+```
+
+---
+
+## Step 2 — Type the State Contract
+
+LangGraph's `MessagesState` provides the `messages` list (LangChain message history). `ArchitectState` extends it with domain fields that flow through the graph:
+
+```python
+class ArchitectState(MessagesState):
+    requirement: str
+    raw_history: list[dict]
+    user_intent: str               # "plan" | "accept" | "refine"
+    prior_solution: dict | None    # solution from the previous turn (refine context)
+    solution: dict | None
+    solution_review_comments: list[str]
+    solution_approved: bool
+    tickets: list[dict]
+    ticket_review_comments: list[str]
+    tickets_approved: bool
+    final_reply: dict | None
+```
+
+Each node returns a partial dict — only the fields it touches. LangGraph merges the update into the existing state. A node that does not touch `tickets` leaves `tickets` unchanged. This makes each node's contract explicit: `SolutionReviewNode` only writes `solution_approved` and `solution_review_comments`; it never touches `tickets`.
+
+`raw_history` is distinct from `messages`. `messages` is the LangChain message list for the current turn. `raw_history` is the full serialised `MessageInterface[]` from previous turns in the conversation — needed for intent classification and for recovering the prior plan when the user says "reduce the complexity".
+
+---
+
+## Step 3 — Node Classes with Injected Dependencies
+
+Each node is a Python class. The constructor receives its dependencies; `__call__` executes the node logic. LangGraph accepts any callable — an instance with `__call__` satisfies that contract without any special registration.
+
+Each node's concerns are cleanly separated across three directories:
+
+- **`agent/schemas/`** — Pydantic output models (`SolutionOut`, `PlanOut`, etc.), one file per node
+- **`agent/personas/`** — system prompts that define the LLM's role and behaviour, one file per node
+- **`agent/templates/`** — parameterised user prompt strings (`SOLUTION_USER_NEW`, `SOLUTION_USER_REFINE`, etc.), one file per node
+
+A node imports exactly what it needs and contains only logic:
+
+```python
+from app.agent.schemas.solution_schema import SolutionOut
+from app.agent.personas.solution_persona import SOLUTION_PERSONA
+from app.agent.templates.solution_templates import SOLUTION_USER_NEW, SOLUTION_USER_REFINE, SOLUTION_USER_REVISE
+
+class SolutionNode:
+    def __init__(self, llm: ChatAnthropic):
+        self._llm = llm.with_structured_output(SolutionOut)
+
+    async def __call__(self, state: ArchitectState) -> dict:
+        ...
+        prompt = self._build_prompt(state, requirement, comments, prior_solution)
+        result: SolutionOut = await self._llm.ainvoke([SystemMessage(content=SOLUTION_PERSONA), HumanMessage(content=prompt)])
+        return {"solution": result.model_dump(), "solution_approved": False}
+```
+
+`with_structured_output(SolutionOut)` is bound once in `__init__`, not on every invocation. The LLM instance is shared across all nodes — a single `ChatAnthropic` object is created in the container and injected wherever it is needed:
+
+```python
+class Container:
+    @cached_property
+    def llm(self) -> ChatAnthropic:
+        return ChatAnthropic(model="claude-sonnet-4-6", api_key=settings.anthropic_api_key, max_tokens=4096)
+
+    @cached_property
+    def rabbitmq_publisher(self) -> RabbitMQPublisher:
+        return RabbitMQPublisher(settings.rabbitmq_url)
+
+    @cached_property
+    def agent_graph(self):
+        return ArchitectGraph(self.llm, self.rabbitmq_publisher).build()
+```
+
+---
+
+## Step 4 — Structured Output Schemas
+
+Every node that calls an LLM uses `with_structured_output()` with a Pydantic model. The model is the contract: the LLM is forced to return valid JSON matching the schema, and the code never parses free-form text. Each schema lives in its own file under `agent/schemas/`:
+
+```python
+# agent/schemas/solution_schema.py
+class SolutionOut(BaseModel):
+    architecture: str
+    components: list[ComponentOut]
+
+# agent/schemas/solution_review_schema.py
+class SolutionReviewOut(BaseModel):
+    approved: bool
+    comments: list[str] = []
+
+# agent/schemas/plan_schema.py
+class PlanOut(BaseModel):
+    tickets: list[TicketOut]
+
+# agent/schemas/plan_review_schema.py
+class PlanReviewOut(BaseModel):
+    approved: bool
+    comments: list[str] = []
+```
+
+The reviewer models have `comments: list[str] = []` as an optional field with a default. This is important: when the LLM approves, it may omit `comments` entirely — a required field would raise a `ValidationError`. Making it optional with a default means approval responses always parse cleanly.
+
+The `approved` field drives the conditional edge directly. No string matching, no post-processing — the Pydantic model is both the output parser and the routing signal:
+
+```python
+return {
+    "solution_approved": result.approved,
+    "solution_review_comments": result.comments if not result.approved else [],
+}
+```
+
+---
+
+## Step 5 — Three-Path Intent Routing
+
+The first node in every graph run is `IntentNode`. It classifies the user's message into one of three intents:
+
+```python
+# agent/schemas/intent_schema.py
+class IntentOut(BaseModel):
+    intent: Literal["accept", "refine", "plan"]
+```
+
+The persona draws a clear line between the three:
+
+```
+- "accept": user is satisfied and wants to proceed ("looks good", "yes", "create it")
+- "refine": user wants to change the existing plan ("reduce complexity", "add a security ticket")
+- "plan": first message or new unrelated requirement
+```
+
+When the intent is `refine`, the node extracts the prior solution from `raw_history` for context. When the intent is `accept`, it publishes an `AcceptEvent` to RabbitMQ and returns — no state is carried forward because ticket creation happens in a separate service. The two paths are handled in separate methods:
+
+```python
+async def __call__(self, state: ArchitectState) -> dict:
+    ...
+    result: IntentOut = await self._llm.ainvoke([...])
+    if result.intent == "accept":
+        return await self._handle_accept(state)
+    return self._build_updates(state, result)
+
+async def _handle_accept(self, state: ArchitectState) -> dict:
+    conversation_id = state.get("conversation_id", "")
+    for msg in reversed(state.get("raw_history", [])):
+        content = msg.get("content", {})
+        if isinstance(content, dict) and "epic" in content and "tickets" in content:
+            await self._publisher.publish("architecture-agent.accept", {
+                "conversationId": conversation_id,
+                "content": content,
+            })
+            break
+    return {"user_intent": "accept"}
+
+def _build_updates(self, state: ArchitectState, result: IntentOut) -> dict:
+    updates: dict = {"user_intent": result.intent}
+    if result.intent == "refine":
+        for msg in reversed(state.get("raw_history", [])):
+            content = msg.get("content", {})
+            if isinstance(content, dict) and "epic" in content and "tickets" in content:
+                updates["prior_solution"] = content["epic"].get("solution")
+                break
+    return updates
+```
+
+On `accept`, `chat_service` detects `user_intent == "accept"` and skips its own `append_reply_message` call, leaving `agentStatus = isThinking` in Redis. The ticket-agent finalises the conversation. On `refine`, the extracted `prior_solution` travels into `SolutionNode` as context for the revision.
+
+---
+
+## Step 6 — Approval Loops with Reviewer Context
+
+The two approval loops are the core of the quality-control mechanism. `SolutionNode` handles three distinct scenarios based on state. The prompt-selection logic is extracted into a private `_build_prompt` method; `__call__` stays focused on invoking the LLM and returning state updates:
+
+```python
+async def __call__(self, state: ArchitectState) -> dict:
+    requirement = state.get("requirement", "")
+    comments = state.get("solution_review_comments", [])
+    prior_solution = state.get("prior_solution")
+
+    prompt = self._build_prompt(state, requirement, comments, prior_solution)
+    result: SolutionOut = await self._llm.ainvoke([SystemMessage(content=SOLUTION_PERSONA), HumanMessage(content=prompt)])
+    return {"solution": result.model_dump(), "solution_approved": False}
+
+def _build_prompt(self, state, requirement, comments, prior_solution) -> str:
+    if comments:
+        return SOLUTION_USER_REVISE.format(
+            requirement=requirement,
+            current_solution=json.dumps(state.get("solution", {}), indent=2),
+            comments="\n".join(f"- {c}" for c in comments),
+        )
+    if prior_solution:
+        return SOLUTION_USER_REFINE.format(
+            requirement=requirement,
+            prior_solution=json.dumps(prior_solution, indent=2),
+        )
+    return SOLUTION_USER_NEW.format(requirement=requirement)
+```
+
+The three template strings (`SOLUTION_USER_NEW`, `SOLUTION_USER_REFINE`, `SOLUTION_USER_REVISE`) live in `agent/templates/solution_templates.py`, separate from the node.
+
+The reviewer's comments are never discarded — they travel in state from `solution_review_node` back into `solution_node` on the next iteration. The generator sees exactly what was wrong and why. The same pattern applies to `PlanNode` and `PlanReviewNode`.
+
+The reviewer system prompts are calibrated to avoid infinite loops:
+
+```
+Reject (approved=false) only if there are significant gaps or mismatches.
+Approve most reasonable solutions after one revision.
+```
+
+Without this, a strict reviewer and an imperfect generator can loop indefinitely. The instruction sets a practical upper bound: one revision is usually sufficient.
+
+---
+
+## Step 7 — Ticket Agent: A Two-Node StateGraph
+
+The ticket-agent is an independent service with its own LLM, RabbitMQ consumer, and `StateGraph`. Unlike `create_react_agent` — which uses an open-ended loop with no structured output step — this graph separates concerns into two explicit nodes: one that calls tools and one that extracts a typed result.
+
+### Graph structure
+
+```
+START → create_node ◄──────────┐
+            │                  │
+  ┌─[tool calls]──► tools ─────┘
+  │
+  └─[done]──► extract_node → END
+```
+
+`create_node` drives the tool-calling loop. `tools` is a `ToolNode` that executes the calls. `extract_node` uses `with_structured_output(ExtractOut)` to read the tool results from the message history and return a typed `ExtractOut`.
+
+The graph and state are:
+
+```python
+class TicketState(MessagesState):
+    extract_out: ExtractOut | None = None
+
+class TicketGraph:
+    def __init__(self, llm: ChatAnthropic, tools: list[StructuredTool]):
+        self._llm = llm.bind_tools(tools)
+        self._llm_clean = llm
+        self._tools = tools
+
+    def build(self):
+        graph = StateGraph(TicketState)
+        graph.add_node("create_node", CreateNode(self._llm))
+        graph.add_node("tools", ToolNode(self._tools))
+        graph.add_node("extract_node", ExtractNode(self._llm_clean))
+
+        graph.add_edge(START, "create_node")
+        graph.add_conditional_edges("create_node", tools_condition,
+            {"tools": "tools", END: "extract_node"})
+        graph.add_edge("tools", "create_node")
+        graph.add_edge("extract_node", END)
+        return graph.compile()
+```
+
+`tools_condition` routes to `"tools"` when the last AI message contains tool calls, and to `END` (remapped to `"extract_node"`) when the LLM is done. Two separate LLM instances are used: `self._llm` has tools bound (for `create_node`), and `self._llm_clean` does not (for `extract_node`'s `with_structured_output` call).
+
+### CreateNode and ExtractNode
+
+`CreateNode` prepends `CREATE_NODE_PERSONA` and returns the raw `AIMessage` so `tools_condition` can inspect its tool calls:
+
+```python
+class CreateNode:
+    def __init__(self, llm: ChatAnthropic):
+        self._llm = llm
+
+    async def __call__(self, state: TicketState) -> dict:
+        messages = [SystemMessage(content=CREATE_NODE_PERSONA)] + state["messages"]
+        response = await self._llm.ainvoke(messages)
+        return {"messages": [response]}
+```
+
+`ExtractNode` uses `with_structured_output(ExtractOut)` to pull the created IDs out of the full conversation history — no manual `ToolMessage` parsing:
+
+```python
+class ExtractNode:
+    def __init__(self, llm: ChatAnthropic):
+        self._llm = llm.with_structured_output(ExtractOut)
+
+    async def __call__(self, state: TicketState) -> dict:
+        messages = [SystemMessage(content=EXTRACT_NODE_PERSONA)] + state["messages"]
+        result: ExtractOut = await self._llm.ainvoke(messages)
+        return {"extract_out": result}
+```
+
+`ExtractOut` mirrors `FinalReplyInterface` — both have `epicId` and `ticketIds`. `TicketService._extract_reply` reads `state["extract_out"]` directly:
+
+```python
+def _extract_reply(self, state: dict) -> FinalReplyInterface | None:
+    extract_out = state.get("extract_out")
+    if not extract_out:
+        return None
+    return FinalReplyInterface(epicId=extract_out.epicId, ticketIds=extract_out.ticketIds)
+```
+
+### Defining tools with typed schemas
+
+The two MCP operations are exposed as `StructuredTool` instances. Typed Pydantic schemas give the LLM field names and descriptions to work with:
+
+```python
+class EpicInput(BaseModel):
+    id: str = Field(description="Unique identifier for the epic")
+    name: str = Field(description="Name/title of the epic")
+    requirements: list[dict] = Field(default=[], description="List of requirement objects")
+    solution: dict = Field(default={}, description="Solution architecture dict")
+
+def make_create_epic_tool(mcp_client: McpClient) -> StructuredTool:
+    async def _run(id: str, name: str, requirements: list[dict] = [], solution: dict = {}) -> str:
+        result = await mcp_client.call("create_epic", {
+            "epic": {"id": id, "name": name, "requirements": requirements, "solution": solution}
+        })
+        return json.dumps(result)
+
+    return StructuredTool.from_function(
+        name="create_epic",
+        description="Create an epic in the ticket service. Call this when the plan contains an epic to persist.",
+        args_schema=EpicInput,
+        coroutine=_run,
+    )
+```
+
+The `@tool` decorator is not used here because tool instances need to capture `mcp_client` as a closure — a factory function returning a `StructuredTool` is the cleaner pattern when dependencies need to be injected.
+
+`McpClient` wraps FastMCP's `Client` over streamable HTTP. The response is always read from `content[0].text` — FastMCP serialises the return value there regardless of type:
+
+```python
+async def call(self, name: str, arguments: dict):
+    async with Client(self._url) as client:
+        result = await client.call_tool(name, arguments)
+        if result.content and isinstance(result.content[0], TextContent):
+            return json.loads(result.content[0].text)
+        return {}
+```
+
+### Full MCP JSON-RPC exchange
+
+The MCP protocol is JSON-RPC 2.0 over HTTP. Below is a real exchange captured from the logs.
+
+**create_epic request**
+```json
+POST /mcp/
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "method": "tools/call",
+  "params": {
+    "name": "create_epic",
+    "arguments": {
+      "epic": {
+        "id": "5eb18c3c-3084-4a11-8b13-72b2759884c4",
+        "name": "a solution to export reports from Snowflake to SFTP server",
+        "requirements": [
+          { "requirement": "a solution to export reports from Snowflake to SFTP server" }
+        ],
+        "solution": {
+          "architecture": "A lightweight scheduled pipeline where Python scripts query Snowflake, generate report files, and securely transfer them to an SFTP server — orchestrated by a simple job scheduler with built-in logging and alerting.",
+          "components": [
+            {
+              "tech": "Python (Pandas / Paramiko)",
+              "features": [
+                { "feature": "Query Snowflake and extract report data via SQLAlchemy connector" },
+                { "feature": "Transform and format data into CSV or Excel report files" },
+                { "feature": "SSH key-based SFTP upload with checksum verification" },
+                { "feature": "Retry logic and failure handling for SFTP transfer errors" }
+              ]
+            },
+            {
+              "tech": "APScheduler (Python)",
+              "features": [
+                { "feature": "Cron-based scheduling of report export jobs (hourly/daily/weekly)" },
+                { "feature": "Job execution logging and missed-run detection" }
+              ]
+            },
+            {
+              "tech": "Snowflake",
+              "features": [
+                { "feature": "SQL-based report queries via views or parameterized queries" },
+                { "feature": "Role-based access control (RBAC) for secure read-only service account" }
+              ]
+            },
+            {
+              "tech": "SQLite",
+              "features": [
+                { "feature": "Lightweight audit log tracking each export job: report name, row count, file size, status, and timestamp" }
+              ]
+            },
+            {
+              "tech": "Slack Webhooks",
+              "features": [
+                { "feature": "Real-time notifications on export job success or failure" },
+                { "feature": "Daily summary digest of all export job statuses" }
+              ]
+            }
+          ]
+        }
+      }
+    },
+    "_meta": { "progressToken": 1 }
+  }
+}
+```
+
+**create_epic response**
+```json
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0",
+  "id": 1,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"id\": \"5eb18c3c-3084-4a11-8b13-72b2759884c4\", \"name\": \"a solution to export reports from Snowflake to SFTP server\"}"
+      }
+    ]
+  }
+}
+```
+
+**create_ticket request**
+```json
+POST /mcp/
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "method": "tools/call",
+  "params": {
+    "name": "create_ticket",
+    "arguments": {
+      "ticket": {
+        "id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
+        "epicId": "5eb18c3c-3084-4a11-8b13-72b2759884c4",
+        "name": "Implement Snowflake query and report generation module",
+        "requirements": [
+          { "description": "Query Snowflake via SQLAlchemy connector and export results to CSV or Excel" },
+          { "description": "Support dynamic report naming with timestamps and report type identifiers" }
+        ],
+        "acceptance_criteria": [
+          { "description": "Report file is generated correctly for a parameterized Snowflake query" },
+          { "description": "File name includes report type and ISO timestamp" }
+        ]
+      }
+    },
+    "_meta": { "progressToken": 2 }
+  }
+}
+```
+
+**create_ticket response**
+```json
+HTTP/1.1 200 OK
+Content-Type: application/json
+
+{
+  "jsonrpc": "2.0",
+  "id": 2,
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"id\": \"b2c3d4e5-f6a7-8901-bcde-f12345678901\", \"epicId\": \"5eb18c3c-3084-4a11-8b13-72b2759884c4\", \"name\": \"Implement Snowflake query and report generation module\"}"
+      }
+    ]
+  }
+}
+```
+
+`_meta.progressToken` is a standard MCP field for streaming progress notifications. `result.content[0].text` is always a JSON string — `McpClient` calls `json.loads` on it to recover the created object. This is the value that ends up in the `ToolMessage` that `ExtractNode` reads to build `ExtractOut`.
+
+---
+
+## Step 8 — Decouple Services with RabbitMQ
+
+A design-and-review cycle can take 30–120 seconds. Calling the AI agent directly over HTTP creates tight coupling: a slow agent startup means backend requests fail; a long-running request is fragile to network interruptions.
+
+The backend publishes a `ChatEvent` to a durable queue and returns a conversation ID immediately:
+
+```typescript
+publish(event: ChatEvent): void {
+  this.channel.sendToQueue(
+    'architecture-agent.chat',
+    Buffer.from(JSON.stringify(event)),
+    { persistent: true },
+  );
+}
+```
+
+The AI agent subscribes independently:
+
+```python
+async for message in messages:
+    async with message.process():
+        await self._event_handler.handle(message)
+```
+
+`message.process()` ACKs on success and NACKs (requeues) on exception — if the agent crashes mid-processing, the message is redelivered. The backend startup uses linear retry backoff for the initial `amqp.connect()` call, since RabbitMQ may not be ready when the backend container starts:
+
+```typescript
+private async connect(url: string, attempt = 1): Promise<void> {
+  try {
+    this.connection = await amqp.connect(url);
+    ...
+  } catch (err) {
+    if (attempt >= maxAttempts) throw err;
+    const delay = Math.min(1000 * attempt, 10000);
+    await new Promise((r) => setTimeout(r, delay));
+    return this.connect(url, attempt + 1);
+  }
+}
+```
+
+---
+
+## Step 9 — Stream the Thinking Log to the UI
+
+LangGraph's `stream_mode="updates"` emits one update per node completion. After each node, `ChatManager.append_thinking_message` writes a human-readable status message into Redis — the backend's WebSocket gateway picks it up at the next 500 ms poll and pushes it to the browser:
+
+```python
+async for update in self._graph.astream(initial_state, stream_mode="updates"):
+    for node_name, node_output in update.items():
+        self._message_manager.append_thinking_message(chat_obj, node_name, node_output)
+        await self._message_manager.save_chat(key, chat_obj)
+```
+
+Review nodes are handled specially. Rather than replacing the existing "Designing solution architecture..." message, they append a new message with the review result and any comments:
+
+```python
+def _append_review(self, chat_obj, review_label, approved, comments):
+    status = "Approved" if approved else "Needs revision"
+    content = f"{review_label} → Result: {status}"
+    if comments:
+        content += "\nComments:\n" + "\n".join(f"- {c}" for c in comments)
+    chat_obj.messages.append(MessageInterface(
+        actor=ChatActor.agent,
+        content=content,
+        agentStatus=AgentStatus.is_thinking,
+        timestamp=datetime.now(timezone.utc),
+    ))
+```
+
+The browser renders the thinking log in a dark terminal-style box. Each message is parsed by a `ThinkingContent` component that splits on ` → ` to put status badges on their own line, and converts `**bold**` markdown in review comments to `<strong>` elements — the reviewer LLM uses markdown in its comments, and they need to render correctly in the UI.
+
+---
+
+## Step 10 — Multi-Turn Context: The Refine Flow
+
+When a user sends "reduce the complexity of the solution", the agent needs the previous solution as context — otherwise `SolutionNode` starts from scratch and produces something unrelated to what was shown.
+
+`IntentNode` recovers this context by walking backwards through `raw_history` to find the most recent `ReplyInterface` and writing its solution into `prior_solution`:
+
+```python
+for msg in reversed(state.get("raw_history", [])):
+    content = msg.get("content", {})
+    if isinstance(content, dict) and "epic" in content and "tickets" in content:
+        updates["prior_solution"] = content["epic"].get("solution")
+        break
+```
+
+`SolutionNode` then detects `prior_solution` and builds a refinement prompt instead of a new-plan prompt. The user's message ("reduce the complexity") becomes the refinement instruction, and the prior solution becomes the thing being refined.
+
+A second problem: after refinement, `ReplyNode` builds a new epic using `state["requirement"]` — which at that point is "reduce the complexity", not "export reports from Snowflake to SFTP". The fix is to recover the original epic name from the prior reply. This logic is extracted into two private helpers — `_resolve_epic_meta` to recover name and requirements from history, and `_build_epic` to assemble the epic dict:
+
+```python
+def _resolve_epic_meta(self, state, default_name, default_requirements) -> tuple:
+    for msg in reversed(state.get("raw_history", [])):
+        content = msg.get("content", {})
+        if isinstance(content, dict) and "epic" in content:
+            prior_epic = content.get("epic", {})
+            return prior_epic.get("name", default_name), prior_epic.get("requirements", default_requirements)
+    return default_name, default_requirements
+
+def _build_epic(self, epic_id, name, requirements, solution) -> dict:
+    return {
+        "id": epic_id,
+        "name": name[:200] if name else "Software Solution",
+        "requirements": requirements,
+        "solution": solution,
+    }
+```
+
+This ensures the epic name always reflects the original goal, while the solution and tickets reflect the refined output. The early `return` in `_resolve_epic_meta` also eliminates the `break` that was previously needed inside a nested loop.
+
+---
+
+## Step 11 — Frontend: From Plan Card to Persisted Tickets
+
+The UI has three rendering states for an agent reply:
+
+**Thinking log** — shown while the agent is running. Each thinking message is streamed live. The log stays visible after the reply arrives so the user can see what the agent did.
+
+**PlanCard** — shown when `ReplyInterface` arrives (solution architecture + tickets). A `showLinks` prop controls whether the epic name and ticket names are clickable links. During planning they are plain text; after creation they link to `/epic/:id` and `/ticket/:id`.
+
+**FinalReplyCard** — shown when `FinalReplyInterface` arrives (epicId + ticketIds). It fetches the full epic and ticket data from the backend ticket proxy (`/api/epic/:id`, `/api/epic/:epicId/tickets`) and renders them using `PlanCard` with `showLinks={true}`:
+
+```tsx
+export default function FinalReplyCard({ reply }: FinalReplyCardProps) {
+  const [epic, setEpic] = useState<EpicInterface | null>(null);
+  const [tickets, setTickets] = useState<TicketInterface[]>([]);
+
+  useEffect(() => {
+    Promise.all([getEpic(reply.epicId), getEpicTickets(reply.epicId)])
+      .then(([epicData, ticketsData]) => { setEpic(epicData); setTickets(ticketsData); });
+  }, [reply.epicId]);
+
+  return <PlanCard reply={{ epic, tickets }} showLinks />;
+}
+```
+
+The backend's `TicketModule` proxies the browser to the internal ticket-service — the browser only sees `localhost:8000/api/epic/*`, never the internal service hostname:
+
+```typescript
+@Get('epic/:id')
+getEpic(@Param('id') id: string) {
+  return proxyGet(`${TICKET_SERVICE_URL}/api/epic/${id}`);
+}
+```
+
+The `/epic/:id` and `/ticket/:id` Next.js pages fetch the same proxy endpoints and render full detail views — the epic page shows the solution architecture and all tickets, each ticket name linking to the ticket detail page.
+
+---
+
+## Key Design Decisions
+
+**Directed graph for the design phase, explicit two-node graph for the creation phase.** The architect-agent uses a directed graph because the structure is known in advance — produce an architecture, review it, produce tickets, review them. The ticket-agent uses a two-node `StateGraph`: `create_node` drives the tool-calling loop (the LLM reads the plan and decides which tools to call and in what order), and `extract_node` applies `with_structured_output` to extract `epicId` and `ticketIds` from the completed conversation. Separating creation from extraction means the result is always a typed `ExtractOut` — no manual `ToolMessage` parsing in the service layer.
+
+**Two reviewer nodes, not one.** Separating solution review from plan review keeps each reviewer focused on a single concern. The solution reviewer evaluates architecture and technology choices; the plan reviewer evaluates ticket coverage and actionability. A single reviewer would conflate the two, producing comments that are harder for the generator to act on.
+
+**Class-based nodes with `__call__`.** Making each node a class with injected dependencies means the LLM and tool clients are constructed once and reused. `with_structured_output()` is bound in `__init__` — not on every invocation. This also makes each node independently testable: pass a mock LLM, call the instance, assert the returned dict.
+
+**`prior_solution` as a dedicated state field.** When a user refines the plan, the previous solution needs to travel into `SolutionNode` as context. Using a separate `prior_solution` field (distinct from `solution`) means the review loop and the refine flow do not interfere — `solution_review_comments` always refers to the current generation's solution, not the prior turn's.
+
+**Two independent services over a monolithic agent.** The architect-agent and ticket-agent are separate processes communicating via RabbitMQ. The architect-agent publishes and returns immediately — it does not wait for ticket creation. The ticket-agent can be restarted, scaled, or replaced without touching the architect-agent. RabbitMQ durability means an `AcceptEvent` is not lost if the ticket-agent is temporarily down.
+
+**`StructuredTool` factory functions for injected dependencies.** The `create_epic` and `create_ticket` tools need `mcp_client` at runtime. The `@tool` decorator is for module-level functions with no dependencies; `StructuredTool.from_function(coroutine=..., args_schema=...)` is the right pattern when the tool needs to capture a dependency via closure. The factory function (`make_create_epic_tool(mcp_client)`) keeps the tool construction explicit and the schema separate from the wiring.
+
+**`comments: list[str] = []` on reviewer models.** When the LLM approves, it may omit the comments field entirely. A required field raises `ValidationError`; an optional field with a default parses cleanly. The approval path should never fail on a missing comments list.
+
+**Reviewer prompts calibrated for one revision.** Without the instruction "approve most reasonable solutions after one revision", a strict reviewer and a capable-but-imperfect generator can loop many times. The prompt constraint is the practical mechanism that bounds the loop — not a hard limit in code, which would require handling a mid-loop truncation.
+
+**`_append_review` over `_annotate_last`.** An early implementation mutated the "Designing solution architecture..." message in place to append the review result. This hid reviewer comments when the loop ran more than once (each review overwrote the last). Appending a separate review message means every iteration of the approval loop is visible in the thinking log — useful for debugging and for user confidence.
+
+**Backend ticket proxy.** The frontend never talks directly to the ticket-service. A `TicketModule` in the NestJS backend proxies the read endpoints — this keeps the internal service hostname off the browser, and means the ticket-service URL can change without touching the frontend.
+
+**Personas, templates, and schemas in separate directories.** Each node's system prompt (persona), user prompt strings (templates), and output models (schemas) live in their own files under `agent/personas/`, `agent/templates/`, and `agent/schemas/`. A persona defines who the LLM is — it has no parameters and rarely changes. A template is a parameterised string — it changes as the conversation context changes. A schema is a Pydantic model — it defines the JSON contract the LLM must return. Mixing all three inside the node file makes it hard to audit prompts, test schemas in isolation, or update wording without touching logic. The separation means you can read every persona in one place and every output contract in another.
+
+**Private helpers over long `__call__` methods.** Nodes like `SolutionNode`, `IntentNode`, and `ReplyNode` have distinct sub-responsibilities: building the right prompt variant, recovering prior context from history, assembling the output dict. Extracting these into `_build_prompt`, `_build_updates`, `_resolve_epic_meta`, and `_build_epic` keeps `__call__` as a three-line orchestrator (read state → call LLM → return update) and makes each sub-responsibility independently testable.
+
+**`@cached_property` as the singleton mechanism.** The `Container` class uses `@cached_property` for every service object. The first access constructs; every subsequent access returns the cached instance. One decorator replaces the `global _instance / if _instance is None` pattern and keeps the dependency graph explicit and readable.
+
+---
+
+## Source Code
+
+```bash
+git clone https://github.com/ngodinhloc/architect-agent.git
+cd architect-agent
+cp architect-agent/.env.example architect-agent/.env
+# Add ANTHROPIC_API_KEY to architect-agent/.env
+docker compose up --build
+```
+
+Open [http://localhost:3000](http://localhost:3000) and describe a software requirement.
