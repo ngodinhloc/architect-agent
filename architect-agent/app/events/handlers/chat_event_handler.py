@@ -11,14 +11,11 @@ class ChatEventHandler:
 
     async def handle(self, event: ChatEvent) -> None:
         self._logger.info(
-            "Received event correlationId=%s conversationId=%s message=%s history_length=%d",
-            event.correlationId,
-            event.data.conversationId,
-            event.data.message,
+            "Received chat event history_length=%d",
             len(event.data.history),
+            extra={"conversationId": event.data.conversationId},
         )
         request = ChatRequest(
-            correlationId=event.correlationId,
             conversationId=event.data.conversationId,
             message=event.data.message,
             history=event.data.history,

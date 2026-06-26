@@ -12,6 +12,5 @@ class AcceptEventData(BaseModel):
 
 class AcceptEvent(BaseModel):
     eventName: str
-    correlationId: str
     meta: AcceptEventMeta
     data: AcceptEventData

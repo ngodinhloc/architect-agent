@@ -14,7 +14,6 @@ export interface EventDataInterface {
 
 export interface ChatEventInterface {
   eventName: typeof CHAT_EVENT_NAME;
-  correlationId: string;
   meta: EventMetaInterface;
   data: EventDataInterface;
 }

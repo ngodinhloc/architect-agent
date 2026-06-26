@@ -1,4 +1,3 @@
-import uuid
 from langchain_anthropic import ChatAnthropic
 from langchain_core.messages import SystemMessage, HumanMessage
 
@@ -42,7 +41,6 @@ class IntentNode:
             if msg.node == NodeName.reply and isinstance(msg.content, ReplyInterface):
                 await self._publisher.publish(ACCEPT_EVENT_NAME, {
                     "eventName": ACCEPT_EVENT_NAME,
-                    "correlationId": str(uuid.uuid4()),
                     "meta": {"publisher": "architect-agent"},
                     "data": {
                         "conversationId": conversation_id,

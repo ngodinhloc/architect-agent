@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import time
 from contextlib import asynccontextmanager, suppress
@@ -9,12 +10,25 @@ from app.configs.settings import settings
 from app.container import container
 from app.routers import health_router
 
-logging.basicConfig(level=logging.INFO)
+
+class _JsonLogFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        return json.dumps({
+            "conversationId": getattr(record, "conversationId", None),
+            "message": record.getMessage(),
+        })
+
+
+_handler = logging.StreamHandler()
+_handler.setFormatter(_JsonLogFormatter())
+logging.basicConfig(level=logging.INFO, handlers=[_handler], force=True)
 logger = logging.getLogger("http")
+
 
 class _HealthFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         return "/api/health" not in record.getMessage()
+
 
 logging.getLogger("uvicorn.access").addFilter(_HealthFilter())
 

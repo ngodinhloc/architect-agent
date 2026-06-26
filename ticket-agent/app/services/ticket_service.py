@@ -29,13 +29,16 @@ class TicketService:
                 final_state = state
                 last = state["messages"][-1]
                 self._logger.info(
-                    "Agent step | type=%s | conversation=%s",
+                    "Agent step | type=%s",
                     type(last).__name__,
-                    request.conversationId,
+                    extra={"conversationId": request.conversationId},
                 )
         except Exception as e:
             error = str(e)
-            self._logger.exception("Ticket agent error for conversation %s", request.conversationId)
+            self._logger.exception(
+                "Ticket agent error",
+                extra={"conversationId": request.conversationId},
+            )
 
         parsed_reply = self._extract_reply(final_state) if final_state else None
         await self._chat_manager.append_reply_message(key, chat_obj, error, parsed_reply)

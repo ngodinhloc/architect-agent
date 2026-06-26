@@ -98,7 +98,6 @@ class ChatInterface(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    correlationId: str
     conversationId: str
     message: str
     history: list[MessageInterface] = []

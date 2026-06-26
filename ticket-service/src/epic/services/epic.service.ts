@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Epic } from '../../database/entities/epic.entity';
@@ -6,12 +6,15 @@ import { CreateEpicDto } from '../dto/create-epic.dto';
 
 @Injectable()
 export class EpicService {
+  private readonly logger = new Logger(EpicService.name);
+
   constructor(
     @InjectRepository(Epic)
     private readonly epicRepo: Repository<Epic>,
   ) {}
 
   async create(dto: CreateEpicDto): Promise<Epic> {
+    this.logger.log(JSON.stringify({ conversationId: null, message: `Creating epic id=${dto.id}` }));
     const epic = this.epicRepo.create({
       id: dto.id,
       name: dto.name,

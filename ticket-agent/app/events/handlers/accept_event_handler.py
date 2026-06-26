@@ -11,12 +11,10 @@ class AcceptEventHandler:
 
     async def handle(self, event: AcceptEvent) -> None:
         self._logger.info(
-            "Received accept event correlationId=%s conversationId=%s",
-            event.correlationId,
-            event.data.conversationId,
+            "Received accept event",
+            extra={"conversationId": event.data.conversationId},
         )
         request = TicketRequest(
-            correlationId=event.correlationId,
             conversationId=event.data.conversationId,
             content=event.data.content,
         )

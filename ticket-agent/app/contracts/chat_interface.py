@@ -40,6 +40,5 @@ class ChatInterface(BaseModel):
 
 
 class TicketRequest(BaseModel):
-    correlationId: str
     conversationId: str
     content: dict

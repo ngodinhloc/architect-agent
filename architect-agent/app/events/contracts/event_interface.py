@@ -12,6 +12,5 @@ class ChatEventData(BaseModel):
 
 class ChatEvent(BaseModel):
     eventName: str
-    correlationId: str
     meta: ChatEventMeta
     data: ChatEventData

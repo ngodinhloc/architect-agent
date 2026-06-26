@@ -8,7 +8,6 @@ class EventBuilder:
         data = payload["data"]
         return ChatEvent(
             eventName=payload["eventName"],
-            correlationId=payload["correlationId"],
             meta=ChatEventMeta(**payload["meta"]),
             data=ChatEventData(
                 conversationId=data["conversationId"],

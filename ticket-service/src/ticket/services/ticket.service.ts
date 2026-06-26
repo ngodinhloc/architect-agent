@@ -1,4 +1,4 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { Ticket } from '../../database/entities/ticket.entity';
@@ -6,12 +6,15 @@ import { CreateTicketDto } from '../dto/create-ticket.dto';
 
 @Injectable()
 export class TicketService {
+  private readonly logger = new Logger(TicketService.name);
+
   constructor(
     @InjectRepository(Ticket)
     private readonly ticketRepo: Repository<Ticket>,
   ) {}
 
   async create(dto: CreateTicketDto): Promise<Ticket> {
+    this.logger.log(JSON.stringify({ conversationId: null, message: `Creating ticket id=${dto.id} epicId=${dto.epicId}` }));
     const ticket = this.ticketRepo.create({
       id: dto.id,
       epicId: dto.epicId,

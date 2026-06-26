@@ -14,11 +14,16 @@ class MessageProcessor:
         try:
             payload = json.loads(message.body)
             event_name = payload.get("eventName")
+            conversation_id = payload.get("data", {}).get("conversationId")
             handler = self._handler_map.get(event_name)
             if handler is None:
-                self._logger.warning("No handler registered for eventName: %s", event_name)
+                self._logger.warning(
+                    "No handler registered for eventName: %s",
+                    event_name,
+                    extra={"conversationId": conversation_id},
+                )
                 return
             event = EventBuilder.build(payload)
             await handler.handle(event)
         except Exception:
-            self._logger.exception("Failed to process message: %s", message.body)
+            self._logger.exception("Failed to process message")
