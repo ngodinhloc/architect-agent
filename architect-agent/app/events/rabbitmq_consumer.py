@@ -38,4 +38,4 @@ class RabbitMQConsumer:
         async with queue.iterator() as messages:
             async for message in messages:
                 async with message.process():
-                    await self._message_processor.process(message)
+                    asyncio.create_task(self._message_processor.process(message))
