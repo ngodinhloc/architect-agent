@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     rabbitmq_url: str = "amqp://guest:guest@localhost:5672/"
     cors_origins: str = "http://localhost:3000"
     keycloak_url: str = "http://localhost:8080"
-    keycloak_realm: str = "architect"
+    keycloak_realm: str = "architect-multi-agent"
     keycloak_client_id: str = "ticket-agent"
     private_key_pem: str = ""
 

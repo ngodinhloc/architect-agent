@@ -20,7 +20,7 @@ export class KeycloakTokenService {
 
   constructor() {
     const keycloakUrl = process.env.KEYCLOAK_URL ?? 'http://localhost:8080';
-    const realm = process.env.KEYCLOAK_REALM ?? 'architect';
+    const realm = process.env.KEYCLOAK_REALM ?? 'architect-multi-agent';
     this.tokenUrl = `${keycloakUrl}/realms/${realm}/protocol/openid-connect/token`;
     this.clientId = process.env.KEYCLOAK_CLIENT_ID ?? 'backend';
     this.privateKeyPem = (process.env.PRIVATE_KEY_PEM ?? '').replace(/\\n/g, '\n');

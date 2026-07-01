@@ -32,7 +32,7 @@ export class KeycloakAuthMiddleware implements NestMiddleware {
   constructor() {
     const keycloakUrl = process.env.KEYCLOAK_URL ?? 'http://keycloak:8080';
     const keycloakPublicUrl = process.env.KEYCLOAK_PUBLIC_URL ?? keycloakUrl;
-    const realm = process.env.KEYCLOAK_REALM ?? 'architect';
+    const realm = process.env.KEYCLOAK_REALM ?? 'architect-multi-agent';
     this.issuer = `${keycloakPublicUrl}/realms/${realm}`;
     this.jwksUrl = `${keycloakUrl}/realms/${realm}/protocol/openid-connect/certs`;
   }

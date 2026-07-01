@@ -21,7 +21,7 @@ export class JwtGuard implements CanActivate {
 
   constructor() {
     const keycloakUrl = process.env.KEYCLOAK_URL ?? 'http://keycloak:8080';
-    const realm = process.env.KEYCLOAK_REALM ?? 'architect';
+    const realm = process.env.KEYCLOAK_REALM ?? 'architect-multi-agent';
     this.issuer = `${keycloakUrl}/realms/${realm}`;
     this.jwksUrl = `${this.issuer}/protocol/openid-connect/certs`;
   }

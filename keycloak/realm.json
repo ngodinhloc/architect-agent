@@ -1,5 +1,5 @@
 {
-  "realm": "architect",
+  "realm": "architect-multi-agent",
   "enabled": true,
   "sslRequired": "none",
   "accessTokenLifespan": 1800,

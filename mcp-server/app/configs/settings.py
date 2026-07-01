@@ -8,7 +8,7 @@ class Settings(BaseSettings):
     provider_name: str = "Ticket MCP Server"
     provider_host: str = "http://localhost:8002"
     keycloak_url: str = "http://localhost:8080"
-    keycloak_realm: str = "architect"
+    keycloak_realm: str = "architect-multi-agent"
     keycloak_client_id: str = "mcp-server"
     private_key_pem: str = ""
 
