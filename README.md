@@ -12,13 +12,17 @@ A **multi-agent AI** system for software architecture planning. Describe a requi
 
 ![screenshot 4](screenshot_4.png)
 
+![Keycloak login](screenshot_keycloak.png)
+
+![Grafana dashboard](screenshot_grafana.png)
+
 ---
 
 ## Architecture
 
 ![architecture](architecture.png)
 
-The system is composed of eight services communicating over HTTP, WebSocket, RabbitMQ, and Redis. All authentication is centralised in **Keycloak**: service-to-service calls use OAuth 2.0 Client Credentials tokens; browser users log in via OpenID Connect (OIDC) Authorization Code Flow with PKCE.
+The system is composed of ten services communicating over HTTP, WebSocket, RabbitMQ, and Redis. All external and internal HTTP traffic flows through **Kong API Gateway**. Authentication is centralised in **Keycloak**: service-to-service calls use OAuth 2.0 Client Credentials tokens; browser users log in via OpenID Connect (OIDC) Authorization Code Flow with PKCE. Kong validates all JWTs at the gateway before forwarding requests — services trust what Kong passes through.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -31,15 +35,28 @@ The system is composed of eight services communicating over HTTP, WebSocket, Rab
 │  · Keycloak login — OIDC Authorization Code Flow + PKCE             │
 └──────────────────────┬───────────────────────┬──────────────────────┘
                        │ HTTP  /api/*           │ WS  /ws
-                       │ (Next.js proxy)        │ (direct)
+                       │ (Next.js proxy)        │ (direct WebSocket)
 ┌──────────────────────▼───────────────────────▼──────────────────────┐
+│  Kong API Gateway  (port 8888 external · 8000 internal)             │
+│  · JWT plugin — validates kc_token cookie (browser users) or        │
+│    Authorization: Bearer (M2M services) against Keycloak RS256 key  │
+│  · Rate-limiting — 100 req/min per IP (all routes)                  │
+│  · Routes (strip_path: true):                                        │
+│      /backend        → backend:8000                                  │
+│      /ticket-service → ticket-service:8000                           │
+│      /ticket-agent   → ticket-agent:8000                             │
+│      /mcp-server     → mcp-server:8000                               │
+└──────────────────────┬───────────────────────────────────────────────┘
+                       │ strips prefix, forwards verified request
+┌──────────────────────▼──────────────────────────────────────────────┐
 │  Backend  (NestJS · port 8000)                                      │
 │  · REST chat API — saves username per conversation                  │
-│  · Ticket proxy — forwards to ticket-service with Keycloak token    │
+│  · Ticket proxy — forwards to ticket-service via Kong               │
 │  · WebSocket gateway — polls Redis, pushes chat-update events       │
 │  · PostgreSQL — conversations (uuid, username, title, messages)     │
 │  · Redis       — live chat state during agent processing            │
 │  · Publishes ChatEventInterface to RabbitMQ (fire-and-forget)       │
+│  · Decodes kc_token cookie (Kong-verified) to populate req.user     │
 └────────────┬─────────────────────────────┬───────────────────────────┘
              │ AMQP publish                │ read / write
              │ architecture-agent.chat     │
@@ -84,24 +101,24 @@ The system is composed of eight services communicating over HTTP, WebSocket, Rab
 │    └─[done]──► extract_node → END                                   │
 │                                                                     │
 │  · Fetches Keycloak token (Client Credentials) before MCP calls     │
+│  · MCP calls routed through Kong (/mcp-server)                      │
 └────────────┬────────────────────────────────────────────────────────┘
-             │ MCP (streamable HTTP) · Bearer <Keycloak token>
+             │ MCP via Kong (http://kong:8000/mcp-server/mcp/)
+             │ Bearer <Keycloak M2M token>
 ┌────────────▼──────────────────────────┐  ┌───────────────────────┐
 │  MCP Server  (port 8002)              │  │  Keycloak (port 8080) │
 │  create_epic / create_ticket          │  │                       │
-│  · JWT middleware — validates token   │  │  realm: architect     │
-│    against Keycloak JWKS endpoint     │  │                       │
-│  · Fetches Keycloak token before      │  │  M2M clients:         │
-│    calls to ticket-service            │◄─┤  · ticket-agent       │
-└────────────┬──────────────────────────┘  │  · mcp-server         │
-             │ REST /api/epic /api/ticket   │  · backend            │
-             │ Bearer <Keycloak token>      │                       │
-┌────────────▼──────────────────────────┐  │  OIDC clients:        │
-│  Ticket Service  (port 8003)          │◄─┤  · frontend           │
-│  NestJS — epic + ticket CRUD          │  └───────────────────────┘
-│  · JWT guard — validates Keycloak     │
-│    RS256 token against Keycloak JWKS  │
-│  · PostgreSQL                         │
+│  · Fetches Keycloak token before      │  │  realm:               │
+│    calls to ticket-service via Kong   │  │  architect-multi-agent│
+└────────────┬──────────────────────────┘  │                       │
+             │ REST via Kong               │  M2M clients:         │
+             │ (/ticket-service/api/*)     │  · ticket-agent       │
+             │ Bearer <Keycloak M2M token> │  · mcp-server         │
+┌────────────▼──────────────────────────┐  │  · backend            │
+│  Ticket Service  (port 8003)          │  │                       │
+│  NestJS — epic + ticket CRUD          │  │  OIDC clients:        │
+│  · PostgreSQL                         │◄─┤  · frontend           │
+│  · Trusts Kong JWT validation         │  └───────────────────────┘
 └───────────────────────────────────────┘
 ```
 
@@ -117,17 +134,54 @@ The system is composed of eight services communicating over HTTP, WebSocket, Rab
 | mcp-server | 8002 | `mcp-server/` | FastMCP · FastAPI |
 | ticket-service | 8003 | `ticket-service/` | NestJS 11 · TypeORM · PostgreSQL |
 | ticket-agent | 8004 | `ticket-agent/` | FastAPI · LangGraph · StateGraph · Claude |
+| kong | 8888 | `kong/` | Kong 3.8 (DB-less) |
 | rabbitmq | 5672 / 15672 | — | RabbitMQ 3 |
 | redis | 6379 | — | Redis 7 |
 | postgres-backend | 5432 | — | PostgreSQL 17 |
 | postgres-tickets | 5433 | — | PostgreSQL 17 |
 | keycloak | 8080 | `keycloak/` | Keycloak 26 |
+| prometheus | 9090 | `prometheus/` | Prometheus v2.53 |
+| grafana | 3001 | `grafana/` | Grafana 11.1 |
+
+---
+
+## Kong API Gateway
+
+Kong runs in DB-less mode with a declarative configuration generated at startup. The `kong/entrypoint.sh` script fetches Keycloak's RSA public key once at boot and writes the full config to `/tmp/kong.yml`, then starts Kong.
+
+### Routing
+
+All four application services are registered as Kong upstreams with `strip_path: true`:
+
+| External path | Upstream |
+|---|---|
+| `http://localhost:8888/backend/*` | `backend:8000/*` |
+| `http://kong:8000/ticket-service/*` | `ticket-service:8000/*` |
+| `http://kong:8000/ticket-agent/*` | `ticket-agent:8000/*` |
+| `http://kong:8000/mcp-server/*` | `mcp-server:8000/*` |
+
+The frontend accesses Kong on port 8888. All inter-service (east-west) calls use the internal Docker address `http://kong:8000` — no service hardcodes another service's hostname.
+
+### JWT validation
+
+Kong verifies every request locally using the embedded Keycloak RS256 public key — no call to Keycloak per request. Two consumers cover both token types:
+
+| Consumer | `iss` claim | Token source |
+|---|---|---|
+| `browser-user` | `http://localhost:8080/realms/architect-multi-agent` | `kc_token` cookie (browser login) |
+| `service-account` | `http://keycloak:8080/realms/architect-multi-agent` | `Authorization: Bearer` (M2M) |
+
+### Rate limiting
+
+A global rate-limiting plugin caps all routes at **100 requests per minute per IP** (`policy: local`). Every response includes `X-RateLimit-Limit-Minute` and `X-RateLimit-Remaining-Minute` headers.
 
 ---
 
 ## Authentication
 
-All authentication is handled by **Keycloak** (port 8080, realm `architect`), configured via `keycloak/realm.json` which is auto-imported on first startup.
+All authentication is handled by **Keycloak** (port 8080, realm `architect-multi-agent`), configured via `keycloak/realm.json` which is auto-imported on first startup.
+
+![Keycloak](screenshot_keycloak.png)
 
 ### Service-to-service: OAuth 2.0 Client Credentials + `private_key_jwt`
 
@@ -138,27 +192,46 @@ Each service:
 - Serves the corresponding public key as a JWK at `GET /api/.well-known/jwks` (via `JwksService`)
 - Signs a client assertion JWT (`iss=clientId`, `sub=clientId`, `aud=tokenUrl`, unique `jti`, 30-minute `exp`) with RS256
 - Posts the assertion to Keycloak's token endpoint as `client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer`
-- Caches the resulting access token in memory (30-minute TTL); refreshes 30 seconds before expiry with an `asyncio.Lock` to prevent concurrent fetches
+- Caches the resulting access token in memory (30-minute TTL); refreshes 30 seconds before expiry
 
 Keycloak clients are configured with `"clientAuthenticatorType": "client-jwt"` and `"use.jwks.url": "true"` pointing to each service's `/api/.well-known/jwks` endpoint.
 
-The receiving service validates inbound tokens by fetching **Keycloak's** JWKS endpoint (cached 5 minutes), matching by `kid`, and verifying the RS256 signature and `iss` claim.
+**Token validation is handled by Kong**, not by the receiving services. Kong's JWT plugin verifies the RS256 signature locally using Keycloak's public key fetched once at startup. Services behind Kong trust that any forwarded request carries a valid token.
 
 #### Authentication map
 
-| Caller | Recipient | Token source |
-|--------|-----------|-------------|
-| ticket-agent | mcp-server | Keycloak — `ticket-agent` client credentials |
-| mcp-server | ticket-service | Keycloak — `mcp-server` client credentials |
-| backend | ticket-service | Keycloak — `backend` client credentials |
+| Caller | Kong route | Recipient | Token source |
+|--------|-----------|-----------|-------------|
+| ticket-agent | `/mcp-server` | mcp-server | Keycloak — `ticket-agent` client credentials |
+| mcp-server | `/ticket-service` | ticket-service | Keycloak — `mcp-server` client credentials |
+| backend | `/ticket-service` | ticket-service | Keycloak — `backend` client credentials |
 
 ### Frontend user authentication: OIDC Authorization Code Flow with PKCE
 
-The frontend uses `keycloak-js` with `onLoad: 'login-required'` and `pkceMethod: 'S256'`. On first load, unauthenticated users are redirected to Keycloak's login page. After a successful login, the ID token claims (name, email, username) are available client-side. The `frontend` Keycloak client is a public client (no secret) with `standardFlowEnabled: true` and `redirectUris: ["http://localhost:3000/*"]`.
+The frontend uses `keycloak-js` with `onLoad: 'login-required'` and `pkceMethod: 'S256'`. On first load, unauthenticated users are redirected to Keycloak's login page. After a successful login, the access token is stored in a `kc_token` cookie. Kong validates this cookie on every request to `/backend`. The backend's `KeycloakAuthMiddleware` then simply decodes the already-verified token (no JWKS fetch) to populate `req.user` with the username and email.
 
-The backend validates inbound browser requests via `KeycloakAuthMiddleware`, which reads a `kc_token` cookie, fetches **Keycloak's** JWKS endpoint (5-minute cache), and verifies the RS256 signature and `iss` claim. A `KEYCLOAK_PUBLIC_URL` env var is used for the issuer check (browser-issued tokens carry `localhost:8080`, not the internal Docker hostname).
+The authenticated username is stored on the `conversations` table when a new chat is created, and used to scope the chat history endpoint (`GET /api/chat/history`) so each user only sees their own conversations.
 
-The authenticated username is stored on the `conversations` table when a new chat is created, and used to scope the chat history endpoint (`GET /api/chat/history?username=...`) so each user only sees their own conversations.
+---
+
+## Observability
+
+![Grafana](screenshot_grafana.png)
+
+Prometheus (port 9090) scrapes all five application services every 15 seconds. Grafana (port 3001, login `admin`/`admin`) is pre-provisioned with a Prometheus datasource and an overview dashboard.
+
+### Metrics per service
+
+| Service | Metric | Description |
+|---------|--------|-------------|
+| backend | `backend_chat_requests_total{endpoint}` | Requests to `/api/chat/new` and `/api/chat/:id/cont` |
+| backend | `backend_events_published_total` | Events published to RabbitMQ |
+| architect-agent | `architect_agent_events_consumed_total` | RabbitMQ messages consumed |
+| architect-agent | `architect_agent_llm_requests_total{node}` | LLM calls per graph node |
+| ticket-agent | `ticket_agent_events_consumed_total` | RabbitMQ messages consumed |
+| ticket-agent | `ticket_agent_llm_requests_total{node}` | LLM calls per graph node |
+| mcp-server | `mcp_server_tool_requests_total{tool}` | MCP tool calls (`create_epic`, `create_ticket`) |
+| ticket-service | `ticket_service_requests_total{endpoint}` | Requests to epic and ticket endpoints |
 
 ---
 
@@ -186,20 +259,20 @@ The authenticated username is stored on the `conversations` table when a new cha
 |--------|------|-------------|
 | `POST` | `/api/chat/new` | Create conversation in PostgreSQL + Redis, publish `ChatEvent` to RabbitMQ |
 | `POST` | `/api/chat/:id/cont` | Append user message, publish `ChatEvent` to RabbitMQ |
-| `GET` | `/api/chat/history` | Return conversations for a given `?username=` (id, title, createdAt) |
+| `GET` | `/api/chat/history` | Return conversations for the logged-in user (id, title, createdAt) |
 | `GET` | `/api/chat/:id` | Live state from Redis, or persisted from PostgreSQL |
 | `POST` | `/api/chat/:id/stop` | Persist messages to PostgreSQL, delete Redis key |
 | `WS` | `/ws` | Polls Redis at 500 ms, pushes `chat-update` events until `agentStatus === hasReplied` |
 
 ### Ticket Proxy
 
-Proxies the browser to the internal ticket-service (not directly reachable from the browser). Before forwarding, `KeycloakTokenService` obtains a Keycloak access token via the `backend` client credentials and attaches it as `Authorization: Bearer`.
+Proxies the browser to the internal ticket-service via Kong. Before forwarding, `KeycloakTokenService` obtains a Keycloak access token via the `backend` client credentials and attaches it as `Authorization: Bearer`. Kong validates this M2M token before the request reaches ticket-service.
 
 | Method | Path | Proxies to |
 |--------|------|------------|
-| `GET` | `/api/epic/:id` | `ticket-service /api/epic/:id` |
-| `GET` | `/api/epic/:epicId/tickets` | `ticket-service /api/epic/:epicId/tickets` |
-| `GET` | `/api/ticket/:id` | `ticket-service /api/ticket/:id` |
+| `GET` | `/api/epic/:id` | `kong:8000/ticket-service/api/epic/:id` |
+| `GET` | `/api/epic/:epicId/tickets` | `kong:8000/ticket-service/api/epic/:epicId/tickets` |
+| `GET` | `/api/ticket/:id` | `kong:8000/ticket-service/api/ticket/:id` |
 
 ---
 
@@ -317,7 +390,7 @@ On startup, `McpToolBuilder` reads `mcp_tools` from Redis and dynamically create
 | `create_epic` | `mcp_tools` Redis key | Calls MCP `create_epic` → ticket-service `POST /api/epic/` |
 | `create_ticket` | `mcp_tools` Redis key | Calls MCP `create_ticket` → ticket-service `POST /api/ticket/` |
 
-`McpClient` authenticates each MCP call by fetching a Keycloak access token via `KeycloakTokenService` (Client Credentials) and passing it through a `_BearerAuth` adapter — FastMCP's `Client` accepts an `httpx.Auth` instance, not raw headers.
+`McpClient` authenticates each MCP call by fetching a Keycloak access token via `KeycloakTokenService` (Client Credentials) and passing it through a `_BearerAuth` adapter — FastMCP's `Client` accepts an `httpx.Auth` instance, not raw headers. The call is routed through Kong (`http://kong:8000/mcp-server`), where Kong validates the M2M JWT before forwarding to the MCP server.
 
 After `extract_node` writes `ExtractOut` to state, `TicketService` reads it directly to build `FinalReplyInterface`, writes it to Redis, and sets `agentStatus = hasReplied` — which the backend WebSocket gateway delivers to the browser.
 
@@ -325,9 +398,9 @@ After `extract_node` writes `ExtractOut` to state, `TicketService` reads it dire
 
 ## MCP Server (port 8002)
 
-Exposes two tools via MCP protocol (streamable HTTP at `POST /mcp/`). Translates AI tool calls into REST calls to the ticket-service.
+Exposes two tools via MCP protocol (streamable HTTP at `POST /mcp/`). Translates AI tool calls into REST calls to the ticket-service via Kong.
 
-Incoming requests to `POST /mcp/` pass through a **JWT middleware** that validates the caller's Keycloak-issued RS256 token. The middleware fetches and caches Keycloak's JWKS (5-minute TTL), verifies the RS256 signature and `iss` claim, and passes the request through on success. Outbound REST calls to ticket-service include a Keycloak access token obtained by `KeycloakTokenService` using the `mcp-server` client credentials.
+Inbound MCP requests are validated by Kong before they reach the server — no per-service JWT middleware. Outbound REST calls to ticket-service (`http://kong:8000/ticket-service`) include a Keycloak access token obtained by `KeycloakTokenService` using the `mcp-server` client credentials.
 
 On startup, serialises the full tools spec into Redis under the key `mcp_tools` in the following shape:
 
@@ -351,154 +424,11 @@ This allows other services (ticket-agent) to discover and build tools dynamicall
 | `create_epic` | `POST /api/epic/` on ticket-service |
 | `create_ticket` | `POST /api/ticket/` on ticket-service |
 
-### MCP JSON-RPC request/response
-
-The ticket-agent sends JSON-RPC 2.0 requests to `POST /mcp/`. Below is a real exchange captured from the logs.
-
-**create_epic request**
-```json
-POST /mcp/
-Content-Type: application/json
-
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "method": "tools/call",
-  "params": {
-    "name": "create_epic",
-    "arguments": {
-      "epic": {
-        "id": "5eb18c3c-3084-4a11-8b13-72b2759884c4",
-        "name": "a solution to export reports from Snowflake to SFTP server",
-        "requirements": [
-          { "requirement": "a solution to export reports from Snowflake to SFTP server" }
-        ],
-        "solution": {
-          "architecture": "A lightweight scheduled pipeline where Python scripts query Snowflake, generate report files, and securely transfer them to an SFTP server — orchestrated by a simple job scheduler with built-in logging and alerting.",
-          "components": [
-            {
-              "tech": "Python (Pandas / Paramiko)",
-              "features": [
-                { "feature": "Query Snowflake and extract report data via SQLAlchemy connector" },
-                { "feature": "Transform and format data into CSV or Excel report files" },
-                { "feature": "SSH key-based SFTP upload with checksum verification" },
-                { "feature": "Retry logic and failure handling for SFTP transfer errors" }
-              ]
-            },
-            {
-              "tech": "APScheduler (Python)",
-              "features": [
-                { "feature": "Cron-based scheduling of report export jobs (hourly/daily/weekly)" },
-                { "feature": "Job execution logging and missed-run detection" }
-              ]
-            },
-            {
-              "tech": "Snowflake",
-              "features": [
-                { "feature": "SQL-based report queries via views or parameterized queries" },
-                { "feature": "Role-based access control (RBAC) for secure read-only service account" }
-              ]
-            },
-            {
-              "tech": "SQLite",
-              "features": [
-                { "feature": "Lightweight audit log tracking each export job: report name, row count, file size, status, and timestamp" }
-              ]
-            },
-            {
-              "tech": "Slack Webhooks",
-              "features": [
-                { "feature": "Real-time notifications on export job success or failure" },
-                { "feature": "Daily summary digest of all export job statuses" }
-              ]
-            }
-          ]
-        }
-      }
-    },
-    "_meta": { "progressToken": 1 }
-  }
-}
-```
-
-**create_epic response**
-```json
-HTTP/1.1 200 OK
-Content-Type: application/json
-
-{
-  "jsonrpc": "2.0",
-  "id": 1,
-  "result": {
-    "content": [
-      {
-        "type": "text",
-        "text": "{\"id\": \"5eb18c3c-3084-4a11-8b13-72b2759884c4\", \"name\": \"a solution to export reports from Snowflake to SFTP server\"}"
-      }
-    ]
-  }
-}
-```
-
-**create_ticket request**
-```json
-POST /mcp/
-Content-Type: application/json
-
-{
-  "jsonrpc": "2.0",
-  "id": 2,
-  "method": "tools/call",
-  "params": {
-    "name": "create_ticket",
-    "arguments": {
-      "ticket": {
-        "id": "b2c3d4e5-f6a7-8901-bcde-f12345678901",
-        "epicId": "5eb18c3c-3084-4a11-8b13-72b2759884c4",
-        "name": "Implement Snowflake query and report generation module",
-        "requirements": [
-          { "description": "Query Snowflake via SQLAlchemy connector and export results to CSV or Excel" },
-          { "description": "Support dynamic report naming with timestamps and report type identifiers" }
-        ],
-        "acceptance_criteria": [
-          { "description": "Report file is generated correctly for a parameterized Snowflake query" },
-          { "description": "File name includes report type and ISO timestamp" }
-        ]
-      }
-    },
-    "_meta": { "progressToken": 2 }
-  }
-}
-```
-
-**create_ticket response**
-```json
-HTTP/1.1 200 OK
-Content-Type: application/json
-
-{
-  "jsonrpc": "2.0",
-  "id": 2,
-  "result": {
-    "content": [
-      {
-        "type": "text",
-        "text": "{\"id\": \"b2c3d4e5-f6a7-8901-bcde-f12345678901\", \"epicId\": \"5eb18c3c-3084-4a11-8b13-72b2759884c4\", \"name\": \"Implement Snowflake query and report generation module\"}"
-      }
-    ]
-  }
-}
-```
-
-`_meta.progressToken` is a standard MCP field used for streaming progress notifications. `result.content[0].text` is always a JSON string — `McpClient` parses it with `json.loads` to recover the created object.
-
 ---
 
 ## Ticket Service (port 8003)
 
-Minimal NestJS CRUD service backed by its own PostgreSQL instance. No RabbitMQ, no Redis, no WebSocket.
-
-All endpoints except `/api/health` are protected by a global **JWT guard** (`JwtGuard`). The guard validates the Keycloak-issued RS256 token on every request: it fetches and caches Keycloak's JWKS (5-minute TTL), finds the matching key by `kid`, and verifies the RS256 signature and `iss` claim. Unauthenticated requests return 401.
+Minimal NestJS CRUD service backed by its own PostgreSQL instance. No RabbitMQ, no Redis, no WebSocket, no Keycloak dependency. JWT validation is handled upstream by Kong — all requests arriving at this service have already been verified.
 
 | Method | Path | Description |
 |--------|------|-------------|
@@ -507,7 +437,7 @@ All endpoints except `/api/health` are protected by a global **JWT guard** (`Jwt
 | `POST` | `/api/ticket/` | Create ticket |
 | `GET` | `/api/epic/:epicId/tickets` | Get all tickets for an epic |
 | `GET` | `/api/ticket/:id` | Get ticket by id |
-| `GET` | `/api/health` | Health check (no auth required) |
+| `GET` | `/api/health` | Health check |
 
 ---
 
@@ -538,7 +468,7 @@ MessageInterface {
 
 ```
 User types "implement an SFTP solution"
-  → POST /api/chat/new
+  → POST /api/chat/new  (via Kong /backend)
   → backend creates conversation in PostgreSQL + Redis
   → publishes ChatEvent to architecture-agent.chat
   → frontend opens WebSocket
@@ -556,20 +486,20 @@ Architect Agent processes ChatEvent:
 Frontend renders PlanCard (architecture + tickets)
 
 User clicks "Looks good"
-  → POST /api/chat/:id/cont
+  → POST /api/chat/:id/cont  (via Kong /backend)
   → intent_node → "accept"
   → publishes AcceptEvent { conversationId, content } to architecture-agent.accept
   → graph ends (Redis stays isThinking)
 
 Ticket Agent processes AcceptEvent (StateGraph):
   create_node calls tools in order:
-  → create_epic   → MCP create_epic   → ticket-service POST /api/epic/
-  → create_ticket → MCP create_ticket → ticket-service POST /api/ticket/ (× N)
+  → create_epic   → Kong /mcp-server → MCP create_epic   → Kong /ticket-service → POST /api/epic/
+  → create_ticket → Kong /mcp-server → MCP create_ticket → Kong /ticket-service → POST /api/ticket/ (× N)
   extract_node reads tool results → ExtractOut { epicId, ticketIds }
   → FinalReplyInterface written to Redis → agentStatus=hasReplied
 
 Frontend renders FinalReplyCard:
-  · Fetches full epic and tickets via /api/epic/:id and /api/epic/:epicId/tickets
+  · Fetches full epic and tickets via Kong /backend → /api/epic/:id and /api/epic/:epicId/tickets
   · Epic name links to /epic/:id
   · Each ticket name links to /ticket/:id
 ```
@@ -595,7 +525,11 @@ docker compose up --build
 
 Open [http://localhost:3000](http://localhost:3000). You will be redirected to Keycloak login automatically. Log in with `dev` / `dev` (the test user pre-configured in `keycloak/realm.json`).
 
-Keycloak admin UI is available at [http://localhost:8080](http://localhost:8080) — username `admin`, password `admin`.
+- Keycloak admin UI: [http://localhost:8080](http://localhost:8080) — `admin` / `admin`
+- Kong proxy: [http://localhost:8888](http://localhost:8888)
+- Prometheus: [http://localhost:9090](http://localhost:9090)
+- Grafana: [http://localhost:3001](http://localhost:3001) — `admin` / `admin`
+- RabbitMQ management: [http://localhost:15672](http://localhost:15672) — `guest` / `guest`
 
 ### Required environment
 

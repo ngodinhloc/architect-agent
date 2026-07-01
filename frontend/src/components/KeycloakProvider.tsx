@@ -50,7 +50,11 @@ export function KeycloakProvider({ children }: { children: React.ReactNode }) {
         }
         setReady(true);
       })
-      .catch(() => setReady(true));
+      .catch(() => {
+        // Init failed (Keycloak unreachable or misconfigured) — force login on retry
+        // rather than silently allowing unauthenticated access
+        kc.login();
+      });
 
     // Refresh the token (and cookie) before it expires
     kc.onTokenExpired = () => {

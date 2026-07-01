@@ -1,6 +1,5 @@
 import logging
 from functools import cached_property
-from app.auth.jwt_middleware import JwtMiddleware
 from app.auth.keycloak_token_service import KeycloakTokenService
 from app.tools.epic_tool import EpicTool
 from app.tools.ticket_tool import TicketTool
@@ -13,10 +12,6 @@ class Container:
     @cached_property
     def keycloak_token_service(self) -> KeycloakTokenService:
         return KeycloakTokenService()
-
-    @cached_property
-    def jwt_middleware(self) -> JwtMiddleware:
-        return JwtMiddleware(logger=self.logger("jwt_middleware"))
 
     @cached_property
     def epic_tool(self) -> EpicTool:

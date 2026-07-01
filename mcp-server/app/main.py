@@ -81,12 +81,6 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def authenticate(request: Request, call_next):
-    return await container.jwt_middleware.handle(request, call_next)
-
-
-
-@app.middleware("http")
 async def log_requests(request: Request, call_next):
     if request.url.path == "/api/health":
         return await call_next(request)

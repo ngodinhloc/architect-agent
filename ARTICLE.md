@@ -22,6 +22,10 @@ The focus is on the decisions that make this work in practice:
 
 ![Screenshot 4](./screenshot_4.png)
 
+![Keycloak login](./screenshot_keycloak.png)
+
+![Grafana dashboard](./screenshot_grafana.png)
+
 ---
 
 ## Architecture Overview
@@ -32,7 +36,9 @@ The focus is on the decisions that make this work in practice:
 
 **Backend** (NestJS 11, port 8000) — REST chat API and ticket proxy. Creates conversations in PostgreSQL (stores `username` from the authenticated user), manages live state in Redis, publishes `ChatEvent` to RabbitMQ, and drives the WebSocket gateway. Also proxies `/api/epic/*` and `/api/ticket/*` to the ticket-service — each proxy request includes a Keycloak access token obtained via the `backend` client credentials.
 
-**Keycloak** (port 8080, realm `architect`) — central Authorization Server for all authentication. Manages two types of clients: confidential M2M clients (`ticket-agent`, `mcp-server`, `backend`) that use the OAuth 2.0 Client Credentials grant with `private_key_jwt` client authentication (RFC 7523) to obtain access tokens for service-to-service calls, and the public `frontend` OIDC client that uses Authorization Code + PKCE for browser user login. Issues RS256-signed JWTs; receiving services validate tokens by fetching Keycloak's JWKS endpoint. Each M2M service holds its own RSA-2048 private key and serves the public key via `/api/.well-known/jwks`; Keycloak fetches these endpoints to authenticate client assertions. The entire realm configuration is in `keycloak/realm.json` and auto-imported on first startup.
+**Keycloak** (port 8080, realm `architect-multi-agent`) — central Authorization Server for all authentication. Manages two types of clients: confidential M2M clients (`ticket-agent`, `mcp-server`, `backend`) that use the OAuth 2.0 Client Credentials grant with `private_key_jwt` client authentication (RFC 7523) to obtain access tokens for service-to-service calls, and the public `frontend` OIDC client that uses Authorization Code + PKCE for browser user login. Issues RS256-signed JWTs. Each M2M service holds its own RSA-2048 private key and serves the public key via `/api/.well-known/jwks`; Keycloak fetches these endpoints to authenticate client assertions. The entire realm configuration is in `keycloak/realm.json` and auto-imported on first startup.
+
+**Kong API Gateway** (port 8888 external / 8000 internal) — sits in front of all four application services. Validates every inbound JWT locally using Keycloak's RS256 public key fetched once at startup — no per-request call to Keycloak. Two consumers cover both token types: `browser-user` (matches `iss: http://localhost:8080/realms/architect-multi-agent`, reads `kc_token` cookie) and `service-account` (matches `iss: http://keycloak:8080/realms/architect-multi-agent`, reads `Authorization: Bearer`). A global rate-limiting plugin caps all routes at 100 req/min per IP. All inter-service (east-west) traffic is also routed through Kong — services call `http://kong:8000/{prefix}` instead of each other's direct hostnames, making Kong a lightweight service registry.
 
 **RabbitMQ** — two durable queues: `architecture-agent.chat` (backend → architect-agent) and `architecture-agent.accept` (architect-agent → ticket-agent). Both publishers return immediately; consumers process independently.
 
@@ -40,9 +46,9 @@ The focus is on the decisions that make this work in practice:
 
 **Ticket Agent** (FastAPI + LangGraph, port 8004) — subscribes to `architecture-agent.accept` and runs a two-node `StateGraph`. On startup, reads the `mcp_tools` key from Redis and dynamically builds `StructuredTool` instances via `McpToolBuilder`. `create_node` drives a tool-calling loop (`create_epic` → `create_ticket` × N), then `extract_node` reads the tool results and writes `ExtractOut { epicId, ticketIds }` to state. `TicketService` converts this into `FinalReplyInterface`, writes it to Redis, and sets `agentStatus = hasReplied`. Before each MCP call, `KeycloakTokenService` obtains a Keycloak access token using the `ticket-agent` client credentials.
 
-**MCP Server** (FastMCP + FastAPI, port 8002) — exposes `create_epic` and `create_ticket` over the MCP protocol. On startup, serialises the tools spec (name, description, inputSchema, providerHost) into Redis under `mcp_tools` so consumers can discover tools without hardcoding them. Inbound MCP requests are authenticated by a JWT middleware that validates the Keycloak-issued token against Keycloak's JWKS endpoint. Outbound REST calls to ticket-service include a Keycloak token obtained via the `mcp-server` client credentials.
+**MCP Server** (FastMCP + FastAPI, port 8002) — exposes `create_epic` and `create_ticket` over the MCP protocol. On startup, serialises the tools spec (name, description, inputSchema, providerHost) into Redis under `mcp_tools` so consumers can discover tools without hardcoding them. Inbound MCP requests are validated by Kong before they reach the server — no per-service JWT middleware. Outbound REST calls to ticket-service (`http://kong:8000/ticket-service`) include a Keycloak token obtained via the `mcp-server` client credentials.
 
-**Ticket Service** (NestJS 11, port 8003) — minimal CRUD service backed by its own PostgreSQL instance. No RabbitMQ, no Redis, no WebSocket. All endpoints (except `/api/health`) are protected by a global `JwtGuard` that validates Keycloak-issued RS256 tokens against Keycloak's JWKS endpoint.
+**Ticket Service** (NestJS 11, port 8003) — minimal CRUD service backed by its own PostgreSQL instance. No RabbitMQ, no Redis, no WebSocket. JWT validation is handled upstream by Kong — all requests arriving at this service have already been verified.
 
 ---
 
@@ -646,9 +652,9 @@ Content-Type: application/json
 
 ---
 
-## Step 8 — Authentication with Keycloak: OAuth 2.0 and OIDC
+## Step 8 — Authentication with Keycloak and Kong
 
-The ticket-creation path crosses three service boundaries: ticket-agent → mcp-server, mcp-server → ticket-service, and backend → ticket-service. The frontend also needs to identify who is using the app. Both problems are solved with **Keycloak** as the central Authorization Server — but with different flows for each case.
+The ticket-creation path crosses three service boundaries: ticket-agent → mcp-server, mcp-server → ticket-service, and backend → ticket-service. The frontend also needs to identify who is using the app. Both problems are solved with **Keycloak** as the central Authorization Server — but with different flows for each case. **Kong** validates every inbound JWT at the gateway edge so individual services do not need to implement JWKS fetching themselves.
 
 ### Service-to-service: OAuth 2.0 Client Credentials + `private_key_jwt`
 
@@ -760,44 +766,20 @@ async def call(self, name: str, arguments: dict):
 
 `auth_flow` is a generator — `yield request` hands the modified request to the transport; `httpx` drives the response cycle without requiring a second yield.
 
-### Token validation: Keycloak JWKS
+### Token validation: Kong JWT plugin
 
-The receiving services (mcp-server, ticket-service) validate inbound access tokens by fetching **Keycloak's** public keys — not the caller's JWKS. There are two JWKS endpoints in play: each service's own `/api/.well-known/jwks` (used by Keycloak to validate client assertions during the token request), and Keycloak's `/realms/architect/protocol/openid-connect/certs` (used by receiving services to validate the issued access tokens). The middleware validates access tokens against Keycloak:
+Token validation is centralised in **Kong**, not in individual services. Kong's `entrypoint.sh` fetches Keycloak's RS256 public key once at startup and generates a declarative `kong.yml` containing two consumers and the global JWT plugin — no per-request call to Keycloak, no per-service JWKS cache.
 
-```python
-class JwtMiddleware:
-    async def handle(self, request: Request, call_next):
-        if not request.url.path.startswith("/mcp"):
-            return await call_next(request)
+Two consumers handle the two issuer values in circulation:
 
-        auth = request.headers.get("authorization", "")
-        if not auth.startswith("Bearer "):
-            return JSONResponse({"detail": "Missing token"}, status_code=401)
+| Consumer | `iss` claim | Token type | Source |
+|----------|-------------|------------|--------|
+| `browser-user` | `http://localhost:8080/realms/architect-multi-agent` | Browser token | `kc_token` cookie |
+| `service-account` | `http://keycloak:8080/realms/architect-multi-agent` | M2M token | `Authorization: Bearer` |
 
-        token = auth[7:]
-        keys = await self._fetch_keycloak_jwks()
-        header = jwt.get_unverified_header(token)
-        jwk = next((k for k in keys if k.get("kid") == header.get("kid")), None)
-        if not jwk:
-            return JSONResponse({"detail": "No matching key"}, status_code=401)
+Kong's `key_claim_name: iss` maps each token to the matching consumer by reading the `iss` claim. Both consumers embed the same RSA public key (Keycloak only has one active key pair per realm) — the only difference is the `key` field, which holds the expected `iss` value.
 
-        public_key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(jwk))
-        jwt.decode(token, public_key, algorithms=["RS256"],
-                   options={"verify_aud": False})
-        return await call_next(request)
-
-    async def _fetch_keycloak_jwks(self) -> list[dict]:
-        if self._jwks_cache and time.time() - self._jwks_fetched_at < 300:
-            return self._jwks_cache
-        async with httpx.AsyncClient() as client:
-            r = await client.get(self._jwks_url)
-            r.raise_for_status()
-        self._jwks_cache = r.json()["keys"]
-        self._jwks_fetched_at = time.time()
-        return self._jwks_cache
-```
-
-In NestJS (`JwtGuard`), the same logic runs inside `canActivate` using `jose`'s `decodeProtectedHeader`, `importJWK`, and `jwtVerify`.
+There are two JWKS endpoints in play, serving different purposes: each service's own `/api/.well-known/jwks` is used by *Keycloak* to validate client assertions during the token *request*. Kong uses Keycloak's realm public key (fetched at startup) to validate the issued access tokens on every inbound request. Services no longer implement JWKS fetching for inbound request validation.
 
 ### Frontend user authentication: OIDC Authorization Code Flow with PKCE
 
@@ -834,7 +816,7 @@ kc.init({ onLoad: "login-required", pkceMethod: "S256" })
 
 `onLoad: 'login-required'` redirects unauthenticated users to Keycloak before the app renders. `pkceMethod: 'S256'` enables PKCE — a code challenge/verifier pair that prevents authorization code interception attacks (essential for public clients). After login, the user's name and email are shown in the sidebar; `kc.logout()` ends the session on Keycloak's side.
 
-The backend's `KeycloakAuthMiddleware` validates inbound browser requests. It reads a `kc_token` cookie set on login, fetches Keycloak's JWKS (5-minute cache), and verifies the RS256 signature and `iss` claim. A `KEYCLOAK_PUBLIC_URL` env var separates the issuer URL used for token validation (`http://localhost:8080`) from the internal URL used for JWKS fetching (`http://keycloak:8080`) — browser-issued tokens carry the public hostname in their `iss` claim, not the Docker-internal one.
+The backend's `KeycloakAuthMiddleware` runs after Kong has already verified the JWT signature. It reads the `kc_token` cookie and calls `decodeJwt` (from `jose`, decode-only — no signature verification) to extract `preferred_username`, `email`, and `name` claims, which are written to `req.user` for downstream controllers. The `/api/health`, `/api/.well-known/jwks`, and `/metrics` paths are added to a `SKIP_PATHS` set and bypass the middleware entirely — health checks, JWKS serving, and Prometheus scraping are unauthenticated.
 
 The username is included in the `POST /api/chat/new` request body and stored on the `conversations` table, so `GET /api/chat/history?username=...` returns only that user's conversations.
 
@@ -1022,11 +1004,13 @@ The `/epic/:id` and `/ticket/:id` Next.js pages fetch the same proxy endpoints a
 
 **`_append_review` over `_annotate_last`.** An early implementation mutated the "Designing solution architecture..." message in place to append the review result. This hid reviewer comments when the loop ran more than once (each review overwrote the last). Appending a separate review message means every iteration of the approval loop is visible in the thinking log — useful for debugging and for user confidence.
 
-**`private_key_jwt` over shared secrets for M2M authentication.** Each M2M service (ticket-agent, mcp-server, backend) holds its own RSA-2048 private key in `.env` and serves the public key via `/api/.well-known/jwks`. Keycloak is configured with `clientAuthenticatorType: "client-jwt"` and `use.jwks.url: true` — it fetches each service's JWKS endpoint to validate client assertions. This means compromising one service's private key does not expose the others, and rotating a key requires only regenerating the key pair and restarting the service. The alternative — a shared `client_secret` — is a single credential that must be rotated across both Keycloak and the service simultaneously, and its theft gives permanent access until rotated. Two different flows are used deliberately: Client Credentials + `private_key_jwt` for M2M calls (no user identity, access token only), and Authorization Code + PKCE for browser login (OIDC, returns ID token with user claims). Keycloak remains the central Authorization Server — it owns token issuance and the realm-wide JWKS used by receiving services to validate access tokens. The per-service key pairs are only for *client authentication* during the token request, not for signing the issued tokens.
+**`private_key_jwt` over shared secrets for M2M authentication.** Each M2M service (ticket-agent, mcp-server, backend) holds its own RSA-2048 private key in `.env` and serves the public key via `/api/.well-known/jwks`. Keycloak is configured with `clientAuthenticatorType: "client-jwt"` and `use.jwks.url: true` — it fetches each service's JWKS endpoint to validate client assertions. This means compromising one service's private key does not expose the others, and rotating a key requires only regenerating the key pair and restarting the service. The alternative — a shared `client_secret` — is a single credential that must be rotated across both Keycloak and the service simultaneously, and its theft gives permanent access until rotated. Two different flows are used deliberately: Client Credentials + `private_key_jwt` for M2M calls (no user identity, access token only), and Authorization Code + PKCE for browser login (OIDC, returns ID token with user claims). Keycloak remains the central Authorization Server — it owns token issuance and the realm-wide public key. Kong fetches that public key once at startup and validates all access tokens at the gateway edge. The per-service key pairs are only for *client authentication* during the token request, not for signing the issued tokens.
 
 **`_BearerAuth(httpx.Auth)` over `headers=` kwargs.** FastMCP's `Client` does not accept a `headers` kwarg — it uses `httpx` internally and expects an `httpx.Auth` subclass. Implementing `auth_flow` as a one-yield generator is the correct extension point: `yield request` lets `httpx` send the request and handle the response without requiring the auth object to inspect it. The token passed to `_BearerAuth` comes from `KeycloakTokenService.get_token()` — cached in memory, refreshed 30 seconds before expiry.
 
-**Backend ticket proxy.** The frontend never talks directly to the ticket-service. A `TicketModule` in the NestJS backend proxies the read endpoints — this keeps the internal service hostname off the browser, and means the ticket-service URL can change without touching the frontend. The proxy obtains a Keycloak access token via the `backend` client credentials before forwarding each request, so the ticket-service enforces the same JWT validation policy regardless of which internal caller is making the request.
+**Kong as API Gateway and service registry.** Routing all traffic — both north-south (browser to backend) and east-west (service to service) — through Kong means no service hardcodes another service's hostname. ticket-agent calls `http://kong:8000/mcp-server`; mcp-server calls `http://kong:8000/ticket-service`; backend calls `http://kong:8000/ticket-service`. JWT validation, rate-limiting, and routing are all configured in one place. The alternative — each service calling others directly and maintaining its own JWKS cache — scatters auth logic across the codebase and means rotating Keycloak's key requires touching every service. With Kong, key rotation requires only restarting Kong.
+
+**Backend ticket proxy.** The frontend never talks directly to the ticket-service. A `TicketModule` in the NestJS backend proxies the read endpoints — this keeps the internal service hostname off the browser, and means the ticket-service URL can change without touching the frontend. The proxy obtains a Keycloak access token via the `backend` client credentials and routes each request through Kong (`http://kong:8000/ticket-service`), where Kong validates the M2M JWT before forwarding to ticket-service.
 
 **Personas, templates, and schemas in separate directories.** Each node's system prompt (persona), user prompt strings (templates), and output models (schemas) live in their own files under `agent/personas/`, `agent/templates/`, and `agent/schemas/`. A persona defines who the LLM is — it has no parameters and rarely changes. A template is a parameterised string — it changes as the conversation context changes. A schema is a Pydantic model — it defines the JSON contract the LLM must return. Mixing all three inside the node file makes it hard to audit prompts, test schemas in isolation, or update wording without touching logic. The separation means you can read every persona in one place and every output contract in another.
 
